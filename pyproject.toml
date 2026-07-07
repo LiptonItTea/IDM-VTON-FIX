@@ -1,0 +1,46 @@
+[project]
+name = "idm-vton"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = "==3.10.20"
+dependencies = [
+    "torch==2.2.0",
+    "torchvision>=0.15.0",
+    "accelerate==0.25.0",
+    "torchmetrics==1.2.1",
+    "tqdm==4.66.1",
+    "transformers==4.36.2",
+    "diffusers==0.25.0",
+    "einops==0.7.0",
+    "scipy==1.11.1",
+    "opencv-python",
+    "gradio",
+    "fvcore",
+    "cloudpickle",
+    "omegaconf",
+    "pycocotools",
+    "basicsr",
+    "av",
+    "onnxruntime==1.16.2",
+    "huggingface-hub==0.25.2",
+    "fastapi==0.110.0",
+    "starlette==0.36.3",
+    "pydantic==2.6.4",
+    "bitsandbytes",
+    "matplotlib>=3.10.9",
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cu121", marker = "sys_platform == 'win32'" },
+]
+torchvision = [
+  { index = "pytorch-cu121", marker = "sys_platform == 'win32'" },
+]
+bitsandbytes = { url = "https://github.com/jllllll/bitsandbytes-windows-webui/releases/download/wheels/bitsandbytes-0.41.0-py3-none-win_amd64.whl" }
