@@ -25,7 +25,6 @@ from diffusers import DDPMScheduler, AutoencoderKL
 from typing import List
 
 import torch
-from torch import nn
 from transformers import AutoTokenizer
 import numpy as np
 from gradio_demo.utils_mask import get_mask_location
@@ -41,9 +40,6 @@ preprocess_device = "cpu"
 OUTPUT_SIZE_MULTIPLE = 8
 MAX_GENERATION_LONG_SIDE = 2048
 MAX_PREPROCESS_LONG_SIDE = 2048
-USE_BNB_INT8_LINEAR = True
-REQUIRE_BNB_INT8_LINEAR = False
-BNB_INT8_THRESHOLD = 6.0
 
 
 def round_to_multiple(value, multiple=OUTPUT_SIZE_MULTIPLE):
@@ -90,105 +86,6 @@ def pil_to_binary_mask(pil_image, threshold=0):
     mask = (mask * 255).astype(np.uint8)
     output_mask = Image.fromarray(mask)
     return output_mask
-
-
-def get_bnb_linear8bit_class(bnb):
-    if hasattr(bnb, "nn") and hasattr(bnb.nn, "Linear8bitLt"):
-        return bnb.nn.Linear8bitLt
-
-    import importlib
-
-    for module_name in ("bitsandbytes.nn", "bitsandbytes.nn.modules", "bitsandbytes.modules"):
-        try:
-            module = importlib.import_module(module_name)
-        except Exception:
-            continue
-        if hasattr(module, "Linear8bitLt"):
-            return module.Linear8bitLt
-
-    package_path = ", ".join(str(path) for path in getattr(bnb, "__path__", [])) or str(getattr(bnb, "__file__", "unknown"))
-    raise AttributeError(
-        "Could not find bitsandbytes Linear8bitLt. The installed bitsandbytes package appears to be missing "
-        f"its Python nn modules. bitsandbytes location: {package_path}"
-    )
-
-
-def make_bnb_linear8bit_compatible(linear8bit_cls):
-    class Linear8bitLtCompat(linear8bit_cls):
-        def forward(self, input, *args, **kwargs):
-            return super().forward(input)
-
-    return Linear8bitLtCompat
-
-
-def replace_linear_with_bnb_int8(module, module_name, linear8bit_cls):
-    converted = 0
-    for child_name, child in list(module.named_children()):
-        if isinstance(child, nn.Linear):
-            quantized = linear8bit_cls(
-                child.in_features,
-                child.out_features,
-                bias=child.bias is not None,
-                has_fp16_weights=False,
-                threshold=BNB_INT8_THRESHOLD,
-            )
-            quantized.load_state_dict(child.state_dict())
-            quantized.requires_grad_(False)
-            quantized.train(child.training)
-            setattr(module, child_name, quantized)
-            converted += 1
-        else:
-            converted += replace_linear_with_bnb_int8(child, f"{module_name}.{child_name}", linear8bit_cls)
-
-    return converted
-
-
-def apply_bnb_int8_linear_quantization(modules):
-    if not USE_BNB_INT8_LINEAR:
-        return 0
-
-    try:
-        import bitsandbytes as bnb
-    except Exception as exc:
-        message = (
-            "bitsandbytes int8 requested, but bitsandbytes could not be imported. "
-            f"Keeping all modules in fp16. Import error: {exc}"
-        )
-        if REQUIRE_BNB_INT8_LINEAR:
-            raise RuntimeError(message) from exc
-        print(message)
-        return 0
-
-    try:
-        linear8bit_cls = make_bnb_linear8bit_compatible(get_bnb_linear8bit_class(bnb))
-    except Exception as exc:
-        message = f"bitsandbytes imported, but int8 Linear is unavailable. Keeping all modules in fp16. Error: {exc}"
-        if REQUIRE_BNB_INT8_LINEAR:
-            raise RuntimeError(message) from exc
-        print(message)
-        return 0
-
-    total = 0
-    for module_name, module in modules:
-        try:
-            count = replace_linear_with_bnb_int8(module, module_name, linear8bit_cls)
-        except Exception as exc:
-            message = f"Failed to convert {module_name} Linear layers to bitsandbytes int8: {exc}"
-            if REQUIRE_BNB_INT8_LINEAR:
-                raise RuntimeError(message) from exc
-            print(message)
-            count = 0
-        total += count
-        if count:
-            print(f"Replaced {count} Linear layers with bitsandbytes int8 in {module_name}.")
-
-    if USE_BNB_INT8_LINEAR:
-        if total:
-            print(f"Replaced {total} Linear layers with bitsandbytes int8 total.")
-        else:
-            print("No Linear layers were replaced with bitsandbytes int8.")
-
-    return total
 
 
 base_path = 'yisol/IDM-VTON'
@@ -250,14 +147,6 @@ vae.requires_grad_(False)
 unet.requires_grad_(False)
 text_encoder_one.requires_grad_(False)
 text_encoder_two.requires_grad_(False)
-
-apply_bnb_int8_linear_quantization(
-    [
-        ("text_encoder", text_encoder_one),
-        ("text_encoder_2", text_encoder_two),
-        ("image_encoder", image_encoder),
-    ]
-)
 
 tensor_transfrom = transforms.Compose(
     [
@@ -414,8 +303,8 @@ def start_tryon(dict, garm_img, garment_des, is_checked, is_checked_crop, denois
         return images[0].resize(final_size), mask_gray.resize(final_size)
     # return images[0], mask_gray
 
-human = Image.open("person.jpg").convert("RGB")
-garment = Image.open("shirt_trashers.jpg").convert("RGB")
+human = Image.open("./mydemo/person.jpg").convert("RGB")
+garment = Image.open("./mydemo/shirt_trashers.jpg").convert("RGB")
 
 input_dict = {
     "background": human,
@@ -433,4 +322,4 @@ result, mask = start_tryon(
     42,     # seed
 )
 
-result.save("tryon_result.png")
+result.save("./mydemo/tryon_result.png")
