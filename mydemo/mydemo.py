@@ -1,77 +1,74 @@
 import sys
-import os
 from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
+import torch
+from diffusers import AutoencoderKL, DDPMScheduler
+from PIL import Image
+from torchvision import transforms
+from torchvision.transforms.functional import to_pil_image
+from transformers import (
+    AutoTokenizer,
+    CLIPImageProcessor,
+    CLIPTextModel,
+    CLIPTextModelWithProjection,
+    CLIPVisionModelWithProjection,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+GRADIO_DEMO_ROOT = PROJECT_ROOT / "gradio_demo"
 sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(PROJECT_ROOT / "gradio_demo"))
-
-from PIL import Image
+sys.path.insert(0, str(GRADIO_DEMO_ROOT))
 
 if not hasattr(Image, "LINEAR"):
     Image.LINEAR = Image.Resampling.BILINEAR if hasattr(Image, "Resampling") else Image.BILINEAR
 
-import gradio as gr
+import apply_net
+from detectron2.data.detection_utils import _apply_exif_orientation, convert_PIL_to_numpy
+from preprocess.humanparsing.run_parsing import Parsing
+from preprocess.openpose.run_openpose import OpenPose
 from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
 from src.unet_hacked_garmnet import UNet2DConditionModel as UNet2DConditionModel_ref
 from src.unet_hacked_tryon import UNet2DConditionModel
-from transformers import (
-    CLIPImageProcessor,
-    CLIPVisionModelWithProjection,
-    CLIPTextModel,
-    CLIPTextModelWithProjection,
-)
-from diffusers import DDPMScheduler, AutoencoderKL
-from typing import List
-
-import torch
-from transformers import AutoTokenizer
-import numpy as np
-from gradio_demo.utils_mask import get_mask_location
-from torchvision import transforms
-import apply_net
-from preprocess.humanparsing.run_parsing import Parsing
-from preprocess.openpose.run_openpose import OpenPose
-from detectron2.data.detection_utils import convert_PIL_to_numpy, _apply_exif_orientation
-from torchvision.transforms.functional import to_pil_image
-
-device = 'cuda:0' if torch.cuda.is_available() else 'cpu'
-preprocess_device = "cpu"
-OUTPUT_SIZE_MULTIPLE = 8
-MAX_GENERATION_LONG_SIDE = 2048
-MAX_PREPROCESS_LONG_SIDE = 2048
+from utils_mask import get_mask_location
 
 
-def round_to_multiple(value, multiple=OUTPUT_SIZE_MULTIPLE):
-    return max(multiple, int(round(value / multiple) * multiple))
+# Inputs and outputs.
+HUMAN_IMAGE_PATH = PROJECT_ROOT / "mydemo" / "person.jpg"
+GARMENT_IMAGE_PATH = PROJECT_ROOT / "mydemo" / "shirt_trashers.jpg"
+OUTPUT_IMAGE_PATH = PROJECT_ROOT / "mydemo" / "tryon_result.png"
+MASK_PREVIEW_PATH = PROJECT_ROOT / "mydemo" / "mask_preview.png"
 
+# Main switches.
+USE_AUTO_GENERATED_MASK = True
+ENABLE_AUTO_RESIZE_AND_CROP = False
 
-def floor_to_multiple(value, multiple=OUTPUT_SIZE_MULTIPLE):
-    return max(multiple, int(value // multiple) * multiple)
+# Positive values grow the white inpaint/garment mask, negative values are not
+# used so the direction stays explicit. These are applied after IDM-VTON's
+# original parser/openpose mask and are measured at the 768x1024 working size.
+AUTO_MASK_GARMENT_EXPAND_PIXELS = 0
+AUTO_MASK_GARMENT_CONTRACT_PIXELS = 0
 
+# Original Gradio demo settings.
+BASE_MODEL_PATH = "yisol/IDM-VTON"
+GARMENT_DESCRIPTION = "short sleeve round neck t-shirt"
+DENOISE_STEPS = 30
+SEED = 42
+MODEL_TYPE = "hd"
+GARMENT_CATEGORY = "upper_body"
+MODEL_WIDTH = 768
+MODEL_HEIGHT = 1024
+PREPROCESS_WIDTH = 384
+PREPROCESS_HEIGHT = 512
+GUIDANCE_SCALE = 2.0
+STRENGTH = 1.0
+NEGATIVE_PROMPT = "monochrome, lowres, bad anatomy, worst quality, low quality"
 
-def get_constrained_size(source_size, max_long_side):
-    width, height = source_size
-    scale = min(max_long_side / max(width, height), 1.0) if max_long_side else 1.0
-    scaled_width = width * scale
-    scaled_height = height * scale
-
-    out_width = round_to_multiple(scaled_width)
-    out_height = round_to_multiple(scaled_height)
-
-    if max_long_side and max(out_width, out_height) > max_long_side:
-        out_width = floor_to_multiple(scaled_width)
-        out_height = floor_to_multiple(scaled_height)
-
-    return out_width, out_height
-
-
-def get_generation_size(source_size):
-    return get_constrained_size(source_size, MAX_GENERATION_LONG_SIDE)
-
-
-def get_preprocess_size(source_size):
-    return get_constrained_size(source_size, MAX_PREPROCESS_LONG_SIDE)
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
+preprocess_device = 0 if torch.cuda.is_available() else "cpu"
+densepose_device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 def pil_to_binary_mask(pil_image, threshold=0):
@@ -88,52 +85,71 @@ def pil_to_binary_mask(pil_image, threshold=0):
     return output_mask
 
 
-base_path = 'yisol/IDM-VTON'
-example_path = 'E:\\projects\\vton\\idmvton\\IDM-VTON\\gradio_demo\\example'
+def apply_auto_mask_thickness(mask: Image.Image) -> Image.Image:
+    if AUTO_MASK_GARMENT_EXPAND_PIXELS <= 0 and AUTO_MASK_GARMENT_CONTRACT_PIXELS <= 0:
+        return mask
+
+    mask_array = np.array(mask.convert("L"))
+    mask_array = np.where(mask_array > 127, 255, 0).astype(np.uint8)
+
+    if AUTO_MASK_GARMENT_EXPAND_PIXELS > 0:
+        expand = int(AUTO_MASK_GARMENT_EXPAND_PIXELS)
+        kernel_size = 2 * expand + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        mask_array = cv2.dilate(mask_array, kernel, iterations=1)
+
+    if AUTO_MASK_GARMENT_CONTRACT_PIXELS > 0:
+        contract = int(AUTO_MASK_GARMENT_CONTRACT_PIXELS)
+        kernel_size = 2 * contract + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        mask_array = cv2.erode(mask_array, kernel, iterations=1)
+
+    return Image.fromarray(mask_array)
+
 
 unet = UNet2DConditionModel.from_pretrained(
-    base_path,
+    BASE_MODEL_PATH,
     subfolder="unet",
     torch_dtype=torch.float16,
 )
 unet.requires_grad_(False)
+
 tokenizer_one = AutoTokenizer.from_pretrained(
-    base_path,
+    BASE_MODEL_PATH,
     subfolder="tokenizer",
     revision=None,
     use_fast=False,
 )
 tokenizer_two = AutoTokenizer.from_pretrained(
-    base_path,
+    BASE_MODEL_PATH,
     subfolder="tokenizer_2",
     revision=None,
     use_fast=False,
 )
-noise_scheduler = DDPMScheduler.from_pretrained(base_path, subfolder="scheduler")
+noise_scheduler = DDPMScheduler.from_pretrained(BASE_MODEL_PATH, subfolder="scheduler")
 
 text_encoder_one = CLIPTextModel.from_pretrained(
-    base_path,
+    BASE_MODEL_PATH,
     subfolder="text_encoder",
     torch_dtype=torch.float16,
 )
 text_encoder_two = CLIPTextModelWithProjection.from_pretrained(
-    base_path,
+    BASE_MODEL_PATH,
     subfolder="text_encoder_2",
     torch_dtype=torch.float16,
 )
 image_encoder = CLIPVisionModelWithProjection.from_pretrained(
-    base_path,
+    BASE_MODEL_PATH,
     subfolder="image_encoder",
     torch_dtype=torch.float16,
 )
-vae = AutoencoderKL.from_pretrained(base_path,
-                                    subfolder="vae",
-                                    torch_dtype=torch.float16,
-                                    )
-
-# "stabilityai/stable-diffusion-xl-base-1.0",
+vae = AutoencoderKL.from_pretrained(
+    BASE_MODEL_PATH,
+    subfolder="vae",
+    torch_dtype=torch.float16,
+)
 UNet_Encoder = UNet2DConditionModel_ref.from_pretrained(
-    base_path,
+    BASE_MODEL_PATH,
     subfolder="unet_encoder",
     torch_dtype=torch.float16,
 )
@@ -156,7 +172,7 @@ tensor_transfrom = transforms.Compose(
 )
 
 pipe = TryonPipeline.from_pretrained(
-    base_path,
+    BASE_MODEL_PATH,
     unet=unet,
     vae=vae,
     feature_extractor=CLIPImageProcessor(),
@@ -166,20 +182,20 @@ pipe = TryonPipeline.from_pretrained(
     tokenizer_2=tokenizer_two,
     scheduler=noise_scheduler,
     image_encoder=image_encoder,
-    unet_encoder=UNet_Encoder,
     torch_dtype=torch.float16,
 )
-
-if torch.cuda.is_available():
-    pipe.enable_model_cpu_offload()
-    pipe.enable_vae_slicing()
-    pipe.enable_vae_tiling()
+pipe.unet_encoder = UNet_Encoder
 
 
-def start_tryon(dict, garm_img, garment_des, is_checked, is_checked_crop, denoise_steps, seed):
-    human_img_orig = dict["background"].convert("RGB")
+def start_tryon(input_data, garm_img, garment_des, use_auto_mask, use_auto_crop, denoise_steps, seed):
+    openpose_model.preprocessor.body_estimation.model.to(device)
+    pipe.to(device)
+    pipe.unet_encoder.to(device)
 
-    if is_checked_crop:
+    garm_img = garm_img.convert("RGB").resize((MODEL_WIDTH, MODEL_HEIGHT))
+    human_img_orig = input_data["background"].convert("RGB")
+
+    if use_auto_crop:
         width, height = human_img_orig.size
         target_width = int(min(width, height * (3 / 4)))
         target_height = int(min(height, width * (4 / 3)))
@@ -189,58 +205,49 @@ def start_tryon(dict, garm_img, garment_des, is_checked, is_checked_crop, denois
         bottom = (height + target_height) / 2
         cropped_img = human_img_orig.crop((left, top, right, bottom))
         crop_size = cropped_img.size
-        out_size = get_generation_size(crop_size)
-        final_size = crop_size
-        human_img = cropped_img.resize(out_size)
+        human_img = cropped_img.resize((MODEL_WIDTH, MODEL_HEIGHT))
     else:
-        out_size = get_generation_size(human_img_orig.size)
-        final_size = out_size
-        human_img = human_img_orig.resize(out_size)
+        human_img = human_img_orig.resize((MODEL_WIDTH, MODEL_HEIGHT))
 
-    out_w, out_h = out_size
-    preprocess_size = get_preprocess_size(human_img.size)
-    pre_w, pre_h = preprocess_size
-    preprocess_img = human_img.resize(preprocess_size)
-    garm_img = garm_img.convert("RGB").resize(out_size)
-
-    if is_checked:
-        keypoints = openpose_model(preprocess_img, resolution=None)
-        model_parse, _ = parsing_model(preprocess_img)
-        mask, mask_gray = get_mask_location('hd', "upper_body", model_parse, keypoints, width=pre_w, height=pre_h)
-        mask = mask.resize(out_size)
+    if use_auto_mask:
+        keypoints = openpose_model(human_img.resize((PREPROCESS_WIDTH, PREPROCESS_HEIGHT)))
+        model_parse, _ = parsing_model(human_img.resize((PREPROCESS_WIDTH, PREPROCESS_HEIGHT)))
+        mask, _ = get_mask_location(MODEL_TYPE, GARMENT_CATEGORY, model_parse, keypoints)
+        mask = mask.resize((MODEL_WIDTH, MODEL_HEIGHT))
+        mask = apply_auto_mask_thickness(mask)
     else:
-        mask = pil_to_binary_mask(dict['layers'][0].convert("RGB").resize(out_size))
-        # mask = transforms.ToTensor()(mask)
-        # mask = mask.unsqueeze(0)
+        layers = input_data.get("layers") or [None]
+        manual_mask = layers[0]
+        if manual_mask is None:
+            raise ValueError("Manual mask mode requires input_data['layers'][0].")
+        mask = pil_to_binary_mask(manual_mask.convert("RGB").resize((MODEL_WIDTH, MODEL_HEIGHT)))
+
     mask_gray = (1 - transforms.ToTensor()(mask)) * tensor_transfrom(human_img)
     mask_gray = to_pil_image((mask_gray + 1.0) / 2.0)
 
-    human_img_arg = _apply_exif_orientation(preprocess_img)
+    human_img_arg = _apply_exif_orientation(human_img.resize((PREPROCESS_WIDTH, PREPROCESS_HEIGHT)))
     human_img_arg = convert_PIL_to_numpy(human_img_arg, format="BGR")
 
     args = apply_net.create_argument_parser().parse_args(
         (
-            'show',
-            str(PROJECT_ROOT / 'configs' / 'densepose_rcnn_R_50_FPN_s1x.yaml'),
-            str(PROJECT_ROOT / 'ckpt' / 'densepose' / 'model_final_162be9.pkl'),
-            'dp_segm',
-            '-v',
-            '--opts',
-            'MODEL.DEVICE',
-            preprocess_device,
+            "show",
+            str(PROJECT_ROOT / "configs" / "densepose_rcnn_R_50_FPN_s1x.yaml"),
+            str(PROJECT_ROOT / "ckpt" / "densepose" / "model_final_162be9.pkl"),
+            "dp_segm",
+            "-v",
+            "--opts",
+            "MODEL.DEVICE",
+            densepose_device,
         )
     )
-    # verbosity = getattr(args, "verbosity", None)
     pose_img = args.func(args, human_img_arg)
     pose_img = pose_img[:, :, ::-1]
-    pose_img = Image.fromarray(pose_img).resize(out_size)
+    pose_img = Image.fromarray(pose_img).resize((MODEL_WIDTH, MODEL_HEIGHT))
 
     with torch.no_grad():
-        # Extract the images
         with torch.cuda.amp.autocast():
             with torch.no_grad():
                 prompt = "model is wearing " + garment_des
-                negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
                 with torch.inference_mode():
                     (
                         prompt_embeds,
@@ -251,75 +258,92 @@ def start_tryon(dict, garm_img, garment_des, is_checked, is_checked_crop, denois
                         prompt,
                         num_images_per_prompt=1,
                         do_classifier_free_guidance=True,
+                        negative_prompt=NEGATIVE_PROMPT,
+                    )
+
+                prompt = "a photo of " + garment_des
+                negative_prompt = NEGATIVE_PROMPT
+                if not isinstance(prompt, list):
+                    prompt = [prompt] * 1
+                if not isinstance(negative_prompt, list):
+                    negative_prompt = [negative_prompt] * 1
+
+                with torch.inference_mode():
+                    (
+                        prompt_embeds_c,
+                        _,
+                        _,
+                        _,
+                    ) = pipe.encode_prompt(
+                        prompt,
+                        num_images_per_prompt=1,
+                        do_classifier_free_guidance=False,
                         negative_prompt=negative_prompt,
                     )
 
-                    prompt = "a photo of " + garment_des
-                    negative_prompt = "monochrome, lowres, bad anatomy, worst quality, low quality"
-                    if not isinstance(prompt, List):
-                        prompt = [prompt] * 1
-                    if not isinstance(negative_prompt, List):
-                        negative_prompt = [negative_prompt] * 1
-                    with torch.inference_mode():
-                        (
-                            prompt_embeds_c,
-                            _,
-                            _,
-                            _,
-                        ) = pipe.encode_prompt(
-                            prompt,
-                            num_images_per_prompt=1,
-                            do_classifier_free_guidance=False,
-                            negative_prompt=negative_prompt,
-                        )
+                pose_img = tensor_transfrom(pose_img).unsqueeze(0).to(device, torch.float16)
+                garm_tensor = tensor_transfrom(garm_img).unsqueeze(0).to(device, torch.float16)
+                generator = torch.Generator(device).manual_seed(int(seed)) if seed is not None else None
+                images = pipe(
+                    prompt_embeds=prompt_embeds.to(device, torch.float16),
+                    negative_prompt_embeds=negative_prompt_embeds.to(device, torch.float16),
+                    pooled_prompt_embeds=pooled_prompt_embeds.to(device, torch.float16),
+                    negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(device, torch.float16),
+                    num_inference_steps=denoise_steps,
+                    generator=generator,
+                    strength=STRENGTH,
+                    pose_img=pose_img.to(device, torch.float16),
+                    text_embeds_cloth=prompt_embeds_c.to(device, torch.float16),
+                    cloth=garm_tensor.to(device, torch.float16),
+                    mask_image=mask,
+                    image=human_img,
+                    height=MODEL_HEIGHT,
+                    width=MODEL_WIDTH,
+                    ip_adapter_image=garm_img.resize((MODEL_WIDTH, MODEL_HEIGHT)),
+                    guidance_scale=GUIDANCE_SCALE,
+                )[0]
 
-                    pose_img = tensor_transfrom(pose_img).unsqueeze(0).to(device, torch.float16)
-                    garm_tensor = tensor_transfrom(garm_img).unsqueeze(0).to(device, torch.float16)
-                    generator = torch.Generator(device).manual_seed(seed) if seed is not None else None
-                    images = pipe(
-                        prompt_embeds=prompt_embeds.to(device, torch.float16),
-                        negative_prompt_embeds=negative_prompt_embeds.to(device, torch.float16),
-                        pooled_prompt_embeds=pooled_prompt_embeds.to(device, torch.float16),
-                        negative_pooled_prompt_embeds=negative_pooled_prompt_embeds.to(device, torch.float16),
-                        num_inference_steps=denoise_steps,
-                        generator=generator,
-                        strength=1.0,
-                        pose_img=pose_img.to(device, torch.float16),
-                        text_embeds_cloth=prompt_embeds_c.to(device, torch.float16),
-                        cloth=garm_tensor.to(device, torch.float16),
-                        mask_image=mask,
-                        image=human_img,
-                        height=out_h,
-                        width=out_w,
-                        ip_adapter_image=garm_img,
-                        guidance_scale=2.0,
-                    )[0]
-
-    if is_checked_crop:
-        out_img = images[0].resize(final_size)
+    if use_auto_crop:
+        out_img = images[0].resize(crop_size)
         human_img_orig.paste(out_img, (int(left), int(top)))
-        return human_img_orig, mask_gray.resize(final_size)
-    else:
-        return images[0].resize(final_size), mask_gray.resize(final_size)
-    # return images[0], mask_gray
+        return human_img_orig, mask_gray
 
-human = Image.open("./mydemo/person.jpg").convert("RGB")
-garment = Image.open("./mydemo/shirt_trashers.jpg").convert("RGB")
+    return images[0], mask_gray
 
-input_dict = {
-    "background": human,
-    "layers": None,
-    "composite": None,
-}
 
-result, mask = start_tryon(
-    input_dict,
-    garment,
-    "short sleeve round neck t-shirt",
-    True,   # auto mask
-    False,  # auto crop
-    30,     # denoise steps
-    42,     # seed
-)
+def run_tryon(
+    human_image_path: Path,
+    garment_image_path: Path,
+    garment_description: str,
+    manual_mask_path: Optional[Path] = None,
+):
+    human = Image.open(human_image_path).convert("RGB")
+    garment = Image.open(garment_image_path).convert("RGB")
+    manual_mask = Image.open(manual_mask_path).convert("RGB") if manual_mask_path else None
 
-result.save("./mydemo/tryon_result.png")
+    input_data = {
+        "background": human,
+        "layers": [manual_mask] if manual_mask is not None else [None],
+        "composite": None,
+    }
+
+    result, mask_preview = start_tryon(
+        input_data,
+        garment,
+        garment_description,
+        USE_AUTO_GENERATED_MASK,
+        ENABLE_AUTO_RESIZE_AND_CROP,
+        DENOISE_STEPS,
+        SEED,
+    )
+    result.save(OUTPUT_IMAGE_PATH)
+    mask_preview.save(MASK_PREVIEW_PATH)
+    return result, mask_preview
+
+
+if __name__ == "__main__":
+    run_tryon(
+        HUMAN_IMAGE_PATH,
+        GARMENT_IMAGE_PATH,
+        GARMENT_DESCRIPTION,
+    )
