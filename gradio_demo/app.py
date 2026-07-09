@@ -1,11 +1,5 @@
 import sys
-import os
-from pathlib import Path
-
-DEMO_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = DEMO_DIR.parent
-sys.path.insert(0, str(PROJECT_ROOT))
-sys.path.insert(0, str(DEMO_DIR))
+sys.path.append('./')
 from PIL import Image
 import gradio as gr
 from src.tryon_pipeline import StableDiffusionXLInpaintPipeline as TryonPipeline
@@ -21,6 +15,7 @@ from diffusers import DDPMScheduler,AutoencoderKL
 from typing import List
 
 import torch
+import os
 from transformers import AutoTokenizer
 import numpy as np
 from utils_mask import get_mask_location
@@ -170,7 +165,7 @@ def start_tryon(dict,garm_img,garment_des,is_checked,is_checked_crop,denoise_ste
      
     
 
-    args = apply_net.create_argument_parser().parse_args(('show', '../configs/densepose_rcnn_R_50_FPN_s1x.yaml', '../ckpt/densepose/model_final_162be9.pkl', 'dp_segm', '-v', '--opts', 'MODEL.DEVICE', 'cuda'))
+    args = apply_net.create_argument_parser().parse_args(('show', './configs/densepose_rcnn_R_50_FPN_s1x.yaml', './ckpt/densepose/model_final_162be9.pkl', 'dp_segm', '-v', '--opts', 'MODEL.DEVICE', 'cuda'))
     # verbosity = getattr(args, "verbosity", None)
     pose_img = args.func(args,human_img_arg)    
     pose_img = pose_img[:,:,::-1]    
@@ -314,6 +309,4 @@ with image_blocks as demo:
             
 
 
-if __name__ == "__main__":
-    image_blocks.launch(share=True)
-
+image_blocks.launch()
