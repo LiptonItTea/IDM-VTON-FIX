@@ -43,7 +43,7 @@ MASK_PREVIEW_PATH = PROJECT_ROOT / "mydemo" / "mask_preview.png"
 
 # Main switches.
 USE_AUTO_GENERATED_MASK = True
-ENABLE_AUTO_RESIZE_AND_CROP = False
+ENABLE_AUTO_RESIZE_AND_CROP = True
 
 # Positive values grow the white inpaint/garment mask, negative values are not
 # used so the direction stays explicit. These are applied after IDM-VTON's
