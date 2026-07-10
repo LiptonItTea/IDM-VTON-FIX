@@ -1,3 +1,4 @@
+import re
 import sys
 from pathlib import Path
 from typing import Optional
@@ -35,21 +36,28 @@ from src.unet_hacked_tryon import UNet2DConditionModel
 from utils_mask import get_mask_location
 
 
-# Inputs and outputs.
+# Single-image inputs and outputs.
 HUMAN_IMAGE_PATH = PROJECT_ROOT / "mydemo" / "person.jpg"
 GARMENT_IMAGE_PATH = PROJECT_ROOT / "mydemo" / "shirt_trashers.jpg"
 OUTPUT_IMAGE_PATH = PROJECT_ROOT / "mydemo" / "tryon_result.png"
 MASK_PREVIEW_PATH = PROJECT_ROOT / "mydemo" / "mask_preview.png"
 
+# Batch inputs and outputs.
+HUMAN_DIR = PROJECT_ROOT / "mydemo" / "human"
+GARMENT_DIR = PROJECT_ROOT / "mydemo" / "garment"
+RESULT_DIR = PROJECT_ROOT / "mydemo" / "result"
+SAVE_BATCH_MASK_PREVIEWS = False
+MASK_RESULT_DIR = RESULT_DIR / "mask_preview"
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
 # Main switches.
 USE_AUTO_GENERATED_MASK = True
 ENABLE_AUTO_RESIZE_AND_CROP = True
 
-# Positive values grow the white inpaint/garment mask, negative values are not
-# used so the direction stays explicit. These are applied after IDM-VTON's
-# original parser/openpose mask and are measured at the 768x1024 working size.
-AUTO_MASK_GARMENT_EXPAND_PIXELS = 0
-AUTO_MASK_GARMENT_CONTRACT_PIXELS = 0
+# Positive values grow the white inpaint/garment mask. Negative values shrink
+# it. This is applied after IDM-VTON's original parser/openpose mask and is
+# measured at the 768x1024 working size.
+AUTO_MASK_PADDING_PIXELS = 0
 
 # Original Gradio demo settings.
 BASE_MODEL_PATH = "yisol/IDM-VTON"
@@ -71,6 +79,14 @@ preprocess_device = 0 if torch.cuda.is_available() else "cpu"
 densepose_device = "cuda" if torch.cuda.is_available() else "cpu"
 
 
+if __name__ == "__main__":
+    for image_dir in (HUMAN_DIR, GARMENT_DIR):
+        if not image_dir.exists():
+            raise SystemExit(f"Missing input folder: {image_dir}")
+        if not any(path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS for path in image_dir.iterdir()):
+            raise SystemExit(f"No supported image files found in: {image_dir}")
+
+
 def pil_to_binary_mask(pil_image, threshold=0):
     np_image = np.array(pil_image)
     grayscale_image = Image.fromarray(np_image).convert("L")
@@ -86,22 +102,18 @@ def pil_to_binary_mask(pil_image, threshold=0):
 
 
 def apply_auto_mask_thickness(mask: Image.Image) -> Image.Image:
-    if AUTO_MASK_GARMENT_EXPAND_PIXELS <= 0 and AUTO_MASK_GARMENT_CONTRACT_PIXELS <= 0:
+    padding = int(AUTO_MASK_PADDING_PIXELS)
+    if padding == 0:
         return mask
 
     mask_array = np.array(mask.convert("L"))
     mask_array = np.where(mask_array > 127, 255, 0).astype(np.uint8)
+    kernel_size = 2 * abs(padding) + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
 
-    if AUTO_MASK_GARMENT_EXPAND_PIXELS > 0:
-        expand = int(AUTO_MASK_GARMENT_EXPAND_PIXELS)
-        kernel_size = 2 * expand + 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    if padding > 0:
         mask_array = cv2.dilate(mask_array, kernel, iterations=1)
-
-    if AUTO_MASK_GARMENT_CONTRACT_PIXELS > 0:
-        contract = int(AUTO_MASK_GARMENT_CONTRACT_PIXELS)
-        kernel_size = 2 * contract + 1
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    else:
         mask_array = cv2.erode(mask_array, kernel, iterations=1)
 
     return Image.fromarray(mask_array)
@@ -311,11 +323,33 @@ def start_tryon(input_data, garm_img, garment_des, use_auto_mask, use_auto_crop,
     return images[0], mask_gray
 
 
+def list_image_paths(directory: Path) -> list[Path]:
+    if not directory.exists():
+        raise FileNotFoundError(f"Image directory does not exist: {directory}")
+    if not directory.is_dir():
+        raise NotADirectoryError(f"Expected image directory: {directory}")
+
+    image_paths = sorted(
+        path for path in directory.iterdir()
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
+    if not image_paths:
+        raise ValueError(f"No images found in {directory}")
+    return image_paths
+
+
+def safe_stem(path: Path) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", path.stem).strip("._")
+    return stem or "image"
+
+
 def run_tryon(
     human_image_path: Path,
     garment_image_path: Path,
     garment_description: str,
     manual_mask_path: Optional[Path] = None,
+    output_image_path: Optional[Path] = OUTPUT_IMAGE_PATH,
+    mask_preview_path: Optional[Path] = MASK_PREVIEW_PATH,
 ):
     human = Image.open(human_image_path).convert("RGB")
     garment = Image.open(garment_image_path).convert("RGB")
@@ -336,14 +370,44 @@ def run_tryon(
         DENOISE_STEPS,
         SEED,
     )
-    result.save(OUTPUT_IMAGE_PATH)
-    mask_preview.save(MASK_PREVIEW_PATH)
+    if output_image_path is not None:
+        output_image_path.parent.mkdir(parents=True, exist_ok=True)
+        result.save(output_image_path)
+    if mask_preview_path is not None:
+        mask_preview_path.parent.mkdir(parents=True, exist_ok=True)
+        mask_preview.save(mask_preview_path)
     return result, mask_preview
 
 
+def run_batch_tryon(
+    human_dir: Path = HUMAN_DIR,
+    garment_dir: Path = GARMENT_DIR,
+    result_dir: Path = RESULT_DIR,
+    garment_description: str = GARMENT_DESCRIPTION,
+):
+    human_paths = list_image_paths(human_dir)
+    garment_paths = list_image_paths(garment_dir)
+    result_dir.mkdir(parents=True, exist_ok=True)
+    if SAVE_BATCH_MASK_PREVIEWS:
+        MASK_RESULT_DIR.mkdir(parents=True, exist_ok=True)
+
+    total = len(human_paths) * len(garment_paths)
+    completed = 0
+    for human_path in human_paths:
+        for garment_path in garment_paths:
+            completed += 1
+            pair_name = f"{safe_stem(human_path)}__{safe_stem(garment_path)}.png"
+            output_path = result_dir / pair_name
+            mask_path = MASK_RESULT_DIR / pair_name if SAVE_BATCH_MASK_PREVIEWS else None
+            print(f"[{completed}/{total}] {human_path.name} + {garment_path.name} -> {output_path.name}")
+            run_tryon(
+                human_path,
+                garment_path,
+                garment_description,
+                output_image_path=output_path,
+                mask_preview_path=mask_path,
+            )
+
+
 if __name__ == "__main__":
-    run_tryon(
-        HUMAN_IMAGE_PATH,
-        GARMENT_IMAGE_PATH,
-        GARMENT_DESCRIPTION,
-    )
+    run_batch_tryon()
