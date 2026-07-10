@@ -1,3 +1,4 @@
+import json
 import re
 import sys
 from pathlib import Path
@@ -46,6 +47,7 @@ MASK_PREVIEW_PATH = PROJECT_ROOT / "mydemo" / "mask_preview.png"
 HUMAN_DIR = PROJECT_ROOT / "mydemo" / "human"
 GARMENT_DIR = PROJECT_ROOT / "mydemo" / "garment"
 RESULT_DIR = PROJECT_ROOT / "mydemo" / "result"
+GARMENT_LABELS_PATH = PROJECT_ROOT / "mydemo" / "garment_labels.json"
 SAVE_BATCH_MASK_PREVIEWS = False
 MASK_RESULT_DIR = RESULT_DIR / "mask_preview"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
@@ -199,7 +201,16 @@ pipe = TryonPipeline.from_pretrained(
 pipe.unet_encoder = UNet_Encoder
 
 
-def start_tryon(input_data, garm_img, garment_des, use_auto_mask, use_auto_crop, denoise_steps, seed):
+def start_tryon(
+    input_data,
+    garm_img,
+    garment_des,
+    use_auto_mask,
+    use_auto_crop,
+    denoise_steps,
+    seed,
+    garment_category=GARMENT_CATEGORY,
+):
     openpose_model.preprocessor.body_estimation.model.to(device)
     pipe.to(device)
     pipe.unet_encoder.to(device)
@@ -224,7 +235,7 @@ def start_tryon(input_data, garm_img, garment_des, use_auto_mask, use_auto_crop,
     if use_auto_mask:
         keypoints = openpose_model(human_img.resize((PREPROCESS_WIDTH, PREPROCESS_HEIGHT)))
         model_parse, _ = parsing_model(human_img.resize((PREPROCESS_WIDTH, PREPROCESS_HEIGHT)))
-        mask, _ = get_mask_location(MODEL_TYPE, GARMENT_CATEGORY, model_parse, keypoints)
+        mask, _ = get_mask_location(MODEL_TYPE, garment_category, model_parse, keypoints)
         mask = mask.resize((MODEL_WIDTH, MODEL_HEIGHT))
         mask = apply_auto_mask_thickness(mask)
     else:
@@ -343,11 +354,44 @@ def safe_stem(path: Path) -> str:
     return stem or "image"
 
 
+def load_garment_labels(labels_path: Path = GARMENT_LABELS_PATH) -> dict[str, dict[str, str]]:
+    if not labels_path.exists():
+        print(f"Garment label file not found, using fallback description: {labels_path}")
+        return {}
+
+    with labels_path.open("r", encoding="utf-8") as labels_file:
+        labels = json.load(labels_file)
+    if not isinstance(labels, dict):
+        raise ValueError(f"Garment label file must contain a JSON object: {labels_path}")
+    return labels
+
+
+def get_garment_label(
+    garment_path: Path,
+    garment_labels: dict[str, dict[str, str]],
+    fallback_description: str,
+    fallback_category: str = GARMENT_CATEGORY,
+) -> tuple[str, str]:
+    metadata = garment_labels.get(garment_path.name, {})
+    if not isinstance(metadata, dict):
+        raise ValueError(f"Label metadata for {garment_path.name} must be an object.")
+
+    description = metadata.get("description", fallback_description)
+    category = metadata.get("category", fallback_category)
+    if category not in {"upper_body", "lower_body", "dresses"}:
+        raise ValueError(
+            f"Unsupported category for {garment_path.name}: {category}. "
+            "Use upper_body, lower_body, or dresses."
+        )
+    return description, category
+
+
 def run_tryon(
     human_image_path: Path,
     garment_image_path: Path,
     garment_description: str,
     manual_mask_path: Optional[Path] = None,
+    garment_category: str = GARMENT_CATEGORY,
     output_image_path: Optional[Path] = OUTPUT_IMAGE_PATH,
     mask_preview_path: Optional[Path] = MASK_PREVIEW_PATH,
 ):
@@ -369,6 +413,7 @@ def run_tryon(
         ENABLE_AUTO_RESIZE_AND_CROP,
         DENOISE_STEPS,
         SEED,
+        garment_category,
     )
     if output_image_path is not None:
         output_image_path.parent.mkdir(parents=True, exist_ok=True)
@@ -387,6 +432,7 @@ def run_batch_tryon(
 ):
     human_paths = list_image_paths(human_dir)
     garment_paths = list_image_paths(garment_dir)
+    garment_labels = load_garment_labels()
     result_dir.mkdir(parents=True, exist_ok=True)
     if SAVE_BATCH_MASK_PREVIEWS:
         MASK_RESULT_DIR.mkdir(parents=True, exist_ok=True)
@@ -399,11 +445,20 @@ def run_batch_tryon(
             pair_name = f"{safe_stem(human_path)}__{safe_stem(garment_path)}.png"
             output_path = result_dir / pair_name
             mask_path = MASK_RESULT_DIR / pair_name if SAVE_BATCH_MASK_PREVIEWS else None
-            print(f"[{completed}/{total}] {human_path.name} + {garment_path.name} -> {output_path.name}")
+            description, category = get_garment_label(
+                garment_path,
+                garment_labels,
+                garment_description,
+            )
+            print(
+                f"[{completed}/{total}] {human_path.name} + {garment_path.name} "
+                f"({description}, {category}) -> {output_path.name}"
+            )
             run_tryon(
                 human_path,
                 garment_path,
-                garment_description,
+                description,
+                garment_category=category,
                 output_image_path=output_path,
                 mask_preview_path=mask_path,
             )
